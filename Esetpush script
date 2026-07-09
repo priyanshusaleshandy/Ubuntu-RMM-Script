@@ -1,0 +1,108 @@
+#!/bin/bash
+set -e
+
+##############################################
+# CONFIG — inhe apne hisaab se badal lo
+##############################################
+FILESERVER_URL="http://192.168.126.101:9090/eeau_x86_64.bin"
+LOCAL_BIN="/tmp/eset_installer.bin"
+LOGFILE="/var/log/eset_action1_deploy.log"
+
+exec > >(tee -a "$LOGFILE") 2>&1
+echo "===== ESET deployment started: $(date) ====="
+
+##############################################
+# STEP 1: ESET Management Agent register
+##############################################
+echo "----- STEP 1: Registering ESET Management Agent -----"
+
+cat > /tmp/eset_agent_register.sh << 'AGENT_SCRIPT_EOF'
+#!/bin/sh -e
+# (yahan aapka poora upar wala ESET agent registration script paste ho jayega as-is)
+AGENT_SCRIPT_EOF
+
+chmod +x /tmp/eset_agent_register.sh
+/bin/sh /tmp/eset_agent_register.sh
+echo "Agent registration done."
+
+##############################################
+# STEP 2: Secure Boot / MOK preparation
+##############################################
+echo "----- STEP 2: Secure Boot check -----"
+
+SB_STATE=$(mokutil --sb-state 2>&1 || true)
+echo "Secure Boot state: $SB_STATE"
+
+if echo "$SB_STATE" | grep -qi "enabled"; then
+    echo "Secure Boot is ENABLED — preparing MOK key for kernel module signing."
+
+    MOK_DIR="/var/lib/shim-signed/mok"
+    mkdir -p "$MOK_DIR"
+
+    if [ ! -f "$MOK_DIR/MOK.priv" ]; then
+        echo "Generating new MOK signing key..."
+        openssl req -new -x509 -newkey rsa:2048 -keyout "$MOK_DIR/MOK.priv" \
+            -outform DER -out "$MOK_DIR/MOK.der" -nodes -days 36500 \
+            -subj "/CN=Local ESET DKMS signing key/"
+    else
+        echo "MOK key already exists, reusing it."
+    fi
+
+    # Enroll key with a fixed password (change this!) — reboot required to confirm
+    MOK_PASSWORD="ChangeThisPass123"
+    if ! mokutil --list-enrolled 2>/dev/null | grep -q "Local ESET DKMS"; then
+        echo "Queuing MOK key for enrollment (needs password confirmation on next reboot)."
+        echo -e "$MOK_PASSWORD\n$MOK_PASSWORD" | mokutil --import "$MOK_DIR/MOK.der"
+        echo ">>> IMPORTANT: Reboot this machine and enter password '$MOK_PASSWORD' on the blue MOK Manager screen to complete enrollment. <<<"
+        NEEDS_REBOOT=1
+    else
+        echo "MOK key already enrolled."
+    fi
+else
+    echo "Secure Boot is DISABLED — no MOK enrollment needed, kernel module will load normally."
+fi
+
+##############################################
+# STEP 3: Download ESET AV offline installer from local fast server
+##############################################
+echo "----- STEP 3: Downloading offline installer from local server -----"
+curl -f -o "$LOCAL_BIN" "$FILESERVER_URL"
+chmod +x "$LOCAL_BIN"
+echo "Download complete: $(ls -la $LOCAL_BIN)"
+
+##############################################
+# STEP 4: Silent install
+##############################################
+echo "----- STEP 4: Installing ESET Endpoint Antivirus -----"
+
+# NOTE: exact silent flags is confirm karo apni .bin ke --help se pehli baar
+"$LOCAL_BIN" --help > /tmp/eset_help.log 2>&1 || true
+cat /tmp/eset_help.log
+
+"$LOCAL_BIN" --accept-license --silent 2>&1 || {
+    echo "Silent install with --accept-license --silent failed, check /tmp/eset_help.log for correct flags."
+    exit 1
+}
+
+echo "Install command finished."
+
+##############################################
+# STEP 5: Status check (OK confirmation)
+##############################################
+echo "----- STEP 5: Verifying install -----"
+sleep 5
+
+if systemctl list-units --type=service 2>/dev/null | grep -qi eset; then
+    echo "OK: ESET service found and registered with systemd."
+    systemctl status "$(systemctl list-units --type=service | grep -i eset | awk '{print $1}' | head -1)" --no-pager || true
+else
+    echo "WARNING: No ESET systemd service detected — check manually."
+fi
+
+dkms status | grep -i eset || echo "No DKMS module found for eset yet (may need reboot after MOK enrollment)."
+
+if [ "$NEEDS_REBOOT" = "1" ]; then
+    echo "===== ACTION REQUIRED: Reboot this machine and confirm MOK enrollment with password to activate real-time protection. ====="
+fi
+
+echo "===== ESET deployment finished: $(date) ====="
